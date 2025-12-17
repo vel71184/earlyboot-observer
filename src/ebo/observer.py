@@ -7,6 +7,7 @@ import logging
 import random
 import signal
 import socket
+import subprocess
 import sys
 import struct
 import urllib.error
@@ -72,6 +73,15 @@ _HTTP_NEXTCLOUD_STATUS = "HTTP_NEXTCLOUD_STATUS"
 _HTTP_OLLAMA_TAGS = "HTTP_OLLAMA_TAGS"
 _HTTP_FASTAPI_WHISPER_DOCS = "HTTP_FASTAPI_WHISPER_DOCS"
 _http_probes: dict[str, dict[str, object]] = {}
+_TIME_SYNC_CHECK = "TIME_SYNC_OK"
+_TIME_SYNC_DEADLINE_SECONDS = 10
+_TIME_SYNC_RETRY_INTERVAL_SECONDS = 3
+_TIME_SYNC_MAX_RETRIES = 3
+_TIME_SYNC_COMMAND = ("timedatectl", "show", "-p", "NTPSynchronized", "--value")
+_time_sync_probe_started = False
+_time_sync_attempts_made = 0
+_time_sync_check_resolved = False
+_time_sync_attempt_inflight = False
 
 NM_BUS_NAME = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
@@ -92,6 +102,7 @@ def _init_check_engine(runtime_limit: float) -> None:
     _register_net_ready_check(runtime_limit)
     _register_dns_check(runtime_limit)
     _register_quad9_check(runtime_limit)
+    _register_time_sync_check(runtime_limit)
     _register_http_service_checks()
     register_http_probe(
         _HTTP_DEBIAN_CHECK, url="https://deb.debian.org", prerequisites=[_NET_READY_EVENT]
@@ -153,6 +164,21 @@ def _register_quad9_check(runtime_limit: float) -> None:
     _check_engine.register(
         Check(_DNS_QUAD9_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=deadline)
     )
+
+
+def _register_time_sync_check(runtime_limit: float) -> None:
+    if _check_engine is None:
+        return
+    deadline = (
+        min(_TIME_SYNC_DEADLINE_SECONDS, runtime_limit)
+        if runtime_limit
+        else _TIME_SYNC_DEADLINE_SECONDS
+    )
+    _check_engine.register(
+        Check(_TIME_SYNC_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=deadline)
+    )
+    if GLib is None:
+        _check_engine.resolve(_TIME_SYNC_CHECK, Result.SKIP, "GLib unavailable for time sync probe")
 
 
 def register_http_probe(
@@ -639,6 +665,7 @@ def _on_net_ready() -> None:
     _check_engine.resolve(_NET_READY_CHECK, Result.PASS, "network ready")
     _start_dns_probe()
     _start_quad9_probe()
+    _start_time_sync_probe()
 
 
 def _start_dns_probe() -> None:
@@ -826,6 +853,88 @@ def _resolve_quad9_check(result: Result, reason: str) -> None:
         return
     _quad9_check_resolved = True
     _check_engine.resolve(_DNS_QUAD9_CHECK, result, reason)
+
+
+def _start_time_sync_probe() -> None:
+    global _time_sync_probe_started, _time_sync_attempts_made, _time_sync_check_resolved
+    global _time_sync_attempt_inflight
+    if _check_engine is None or GLib is None:
+        return
+    if _time_sync_probe_started:
+        return
+    _time_sync_probe_started = True
+    _time_sync_attempts_made = 0
+    _time_sync_check_resolved = False
+    _time_sync_attempt_inflight = False
+    _schedule_time_sync_attempt(0)
+
+
+def _schedule_time_sync_attempt(delay_seconds: int) -> None:
+    if _time_sync_check_resolved or GLib is None:
+        return
+    GLib.timeout_add_seconds(delay_seconds, _spawn_time_sync_attempt_thread)
+
+
+def _spawn_time_sync_attempt_thread() -> bool:
+    global _time_sync_attempt_inflight
+    if _time_sync_check_resolved or _time_sync_attempt_inflight:
+        return False
+    _time_sync_attempt_inflight = True
+    Thread(target=_run_time_sync_attempt, daemon=True).start()
+    return False
+
+
+def _run_time_sync_attempt() -> None:
+    global _time_sync_attempts_made
+    _time_sync_attempts_made += 1
+    attempt_number = _time_sync_attempts_made
+    synced = _probe_time_sync()
+    if GLib is None:
+        return
+    GLib.idle_add(_handle_time_sync_attempt_result, synced, attempt_number)
+
+
+def _probe_time_sync() -> bool:
+    try:
+        result = subprocess.run(
+            _TIME_SYNC_COMMAND,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        _logger.debug("timedatectl NTPSynchronized check failed: %s", exc)
+        return False
+    output = (result.stdout or "").strip().lower()
+    return output == "yes"
+
+
+def _handle_time_sync_attempt_result(synced: bool, attempt_number: int) -> bool:
+    global _time_sync_attempt_inflight
+    _time_sync_attempt_inflight = False
+    if _time_sync_check_resolved:
+        return False
+    if synced:
+        _resolve_time_sync_check(Result.PASS, f"NTPSynchronized=yes on attempt {attempt_number}")
+        return False
+    if _time_sync_attempts_made > _TIME_SYNC_MAX_RETRIES:
+        attempts_total = _time_sync_attempts_made
+        _resolve_time_sync_check(
+            Result.FAIL, f"NTPSynchronized not reported after {attempts_total} attempts"
+        )
+        return False
+    _schedule_time_sync_attempt(_TIME_SYNC_RETRY_INTERVAL_SECONDS)
+    return False
+
+
+def _resolve_time_sync_check(result: Result, reason: str) -> None:
+    global _time_sync_check_resolved
+    if _time_sync_check_resolved or _check_engine is None:
+        return
+    _time_sync_check_resolved = True
+    _check_engine.resolve(_TIME_SYNC_CHECK, result, reason)
 
 
 def _recompute_net_ready() -> None:
