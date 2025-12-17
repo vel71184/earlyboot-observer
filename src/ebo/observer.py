@@ -29,6 +29,7 @@ _shutdown = Event()
 _logger = logging.getLogger("ebo.observer")
 _main_loop = None
 _check_engine: Engine | None = None
+_check_failures_present = False
 _bus = None
 _last_states: dict[str, tuple[str | None, str | None]] = {}
 _systemd_manager = None
@@ -293,13 +294,16 @@ def _complete_http_probe(name: str, success: bool, reason: str) -> bool:
 
 
 def _finalize_checks() -> None:
+    global _check_failures_present
     if _check_engine is None:
+        _check_failures_present = False
         return
     if _nm_net_ready is not True:
         _check_engine.resolve(_NET_READY_CHECK, Result.SKIP, "NET_READY not observed")
     _check_engine.enforce_deadlines()
     _check_engine.finalize()
     counts, failed = _check_engine.summary()
+    _check_failures_present = bool(failed)
     failed_clause = f" FAILED={','.join(failed)}" if failed else ""
     _logger.info(
         "SUMMARY PASS=%d FAIL=%d SKIP=%d WARN=%d%s",
@@ -1146,7 +1150,7 @@ def main() -> int:
         _shutdown.wait(timeout=RUNTIME_LIMIT_SECONDS)
     _finalize_checks()
     _logger.info("ebo-observer shutting down")
-    return 0
+    return 1 if _check_failures_present else 0
 
 
 if __name__ == "__main__":
