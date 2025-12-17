@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import signal
 import sys
-from threading import Event
+from threading import Event, Timer
+
+from ebo.checks import Check, Engine, Result
 
 try:
     import dbus
@@ -19,6 +21,7 @@ except ImportError:
 _shutdown = Event()
 _logger = logging.getLogger("ebo.observer")
 _main_loop = None
+_check_engine: Engine | None = None
 _bus = None
 _last_states: dict[str, tuple[str | None, str | None]] = {}
 _nm_props = None
@@ -38,6 +41,38 @@ _CONNECTIVITY_STATES = {
     3: "limited",
     4: "full",
 }
+RUNTIME_LIMIT_SECONDS = 30
+
+
+def _init_check_engine(runtime_limit: float) -> None:
+    global _check_engine
+    _check_engine = Engine(_logger, timeout_seconds=runtime_limit)
+    _check_engine.register(Check("CHECK_A", deadline_seconds=runtime_limit))
+    _check_engine.register(Check("CHECK_B", prerequisites=["EVENT_A"], deadline_seconds=runtime_limit))
+    _check_engine.resolve("CHECK_A", Result.PASS, "observer baseline ready")
+
+
+def _emit_demo_event_a() -> bool:
+    if _shutdown.is_set() or _check_engine is None:
+        return False
+    _logger.info("DEMO EVENT EVENT_A observed")
+    _check_engine.emit_event("EVENT_A")
+    _check_engine.resolve("CHECK_B", Result.PASS, "EVENT_A received")
+    return False
+
+
+def _schedule_demo_events(delay_seconds: float) -> None:
+    if GLib is not None:
+        GLib.timeout_add_seconds(int(delay_seconds), _emit_demo_event_a)
+        return
+    Timer(delay_seconds, _emit_demo_event_a).start()
+
+
+def _finalize_checks() -> None:
+    if _check_engine is None:
+        return
+    _check_engine.enforce_deadlines()
+    _check_engine.finalize()
 
 
 def _setup_logging() -> None:
@@ -485,15 +520,18 @@ def _timeout_shutdown() -> bool:
 
 def main() -> int:
     _setup_logging()
+    _init_check_engine(RUNTIME_LIMIT_SECONDS)
+    _schedule_demo_events(1)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     _logger.info("ebo-observer starting up")
     if _connect_dbus():
-        GLib.timeout_add_seconds(30, _timeout_shutdown)
+        GLib.timeout_add_seconds(RUNTIME_LIMIT_SECONDS, _timeout_shutdown)
         _main_loop.run()
     else:
-        _shutdown.wait(timeout=30)
+        _shutdown.wait(timeout=RUNTIME_LIMIT_SECONDS)
+    _finalize_checks()
     _logger.info("ebo-observer shutting down")
     return 0
 
