@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import random
 import signal
 import socket
 import subprocess
 import sys
+import struct
 from threading import Event, Thread
 
 from ebo.checks import Check, Engine, Result
@@ -45,14 +47,21 @@ _UNIT_NAMES = (
 _NET_READY_EVENT = "EVENT_NET_READY"
 _NET_READY_CHECK = "NET_READY"
 _DNS_CHECK = "DNS_OK_SYSTEM"
+_DNS_QUAD9_CHECK = "DNS_OK_QUAD9"
 _DNS_RETRY_INTERVAL_SECONDS = 2
 _DNS_MAX_RETRIES = 5
 _DNS_DEADLINE_SECONDS = 12
 _DNS_ATTEMPT_TIMEOUT_SECONDS = 2
+_DNS_QUAD9_SERVER = "9.9.9.9"
+_DNS_QUAD9_PORT = 53
 _dns_probe_started = False
 _dns_attempts_made = 0
 _dns_check_resolved = False
 _dns_attempt_inflight = False
+_quad9_probe_started = False
+_quad9_attempts_made = 0
+_quad9_check_resolved = False
+_quad9_attempt_inflight = False
 
 NM_BUS_NAME = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
@@ -72,6 +81,7 @@ def _init_check_engine(runtime_limit: float) -> None:
     _register_unit_checks(runtime_limit)
     _register_net_ready_check(runtime_limit)
     _register_dns_check(runtime_limit)
+    _register_quad9_check(runtime_limit)
 
 
 def _register_unit_checks(runtime_limit: float) -> None:
@@ -96,6 +106,15 @@ def _register_dns_check(runtime_limit: float) -> None:
     deadline = min(_DNS_DEADLINE_SECONDS, runtime_limit) if runtime_limit else _DNS_DEADLINE_SECONDS
     _check_engine.register(
         Check(_DNS_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=deadline)
+    )
+
+
+def _register_quad9_check(runtime_limit: float) -> None:
+    if _check_engine is None:
+        return
+    deadline = min(_DNS_DEADLINE_SECONDS, runtime_limit) if runtime_limit else _DNS_DEADLINE_SECONDS
+    _check_engine.register(
+        Check(_DNS_QUAD9_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=deadline)
     )
 
 
@@ -471,6 +490,7 @@ def _on_net_ready() -> None:
     _check_engine.emit_event(_NET_READY_EVENT)
     _check_engine.resolve(_NET_READY_CHECK, Result.PASS, "network ready")
     _start_dns_probe()
+    _start_quad9_probe()
 
 
 def _start_dns_probe() -> None:
@@ -556,6 +576,108 @@ def _resolve_dns_check(result: Result, reason: str) -> None:
         return
     _dns_check_resolved = True
     _check_engine.resolve(_DNS_CHECK, result, reason)
+
+
+def _start_quad9_probe() -> None:
+    global _quad9_probe_started, _quad9_attempts_made, _quad9_check_resolved, _quad9_attempt_inflight
+    if _check_engine is None or GLib is None:
+        return
+    if _quad9_probe_started:
+        return
+    _quad9_probe_started = True
+    _quad9_attempts_made = 0
+    _quad9_check_resolved = False
+    _quad9_attempt_inflight = False
+    _schedule_quad9_attempt(0)
+
+
+def _schedule_quad9_attempt(delay_seconds: int) -> None:
+    if _quad9_check_resolved or GLib is None:
+        return
+    GLib.timeout_add_seconds(delay_seconds, _spawn_quad9_attempt_thread)
+
+
+def _spawn_quad9_attempt_thread() -> bool:
+    global _quad9_attempt_inflight
+    if _quad9_check_resolved or _quad9_attempt_inflight:
+        return False
+    _quad9_attempt_inflight = True
+    Thread(target=_run_quad9_attempt, daemon=True).start()
+    return False
+
+
+def _run_quad9_attempt() -> None:
+    global _quad9_attempts_made
+    _quad9_attempts_made += 1
+    attempt_number = _quad9_attempts_made
+    success = _perform_quad9_lookup()
+    if GLib is None:
+        return
+    GLib.idle_add(_handle_quad9_attempt_result, success, attempt_number)
+
+
+def _build_dns_query(hostname: str) -> tuple[int, bytes]:
+    transaction_id = random.randint(0, 0xFFFF)
+    labels = hostname.split(".")
+    question = b"".join(bytes((len(label),)) + label.encode("ascii") for label in labels) + b"\x00"
+    question += struct.pack("!HH", 1, 1)  # QTYPE=A, QCLASS=IN
+    header = struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0)
+    return transaction_id, header + question
+
+
+def _perform_quad9_lookup() -> bool:
+    transaction_id, query = _build_dns_query("debian.org")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(_DNS_ATTEMPT_TIMEOUT_SECONDS)
+            sock.sendto(query, (_DNS_QUAD9_SERVER, _DNS_QUAD9_PORT))
+            response, _addr = sock.recvfrom(512)
+    except Exception as exc:
+        _logger.debug("Quad9 DNS query failed: %s", exc)
+        return False
+    if len(response) < 12:
+        return False
+    try:
+        resp_id, flags, _qdcount, ancount, _nscount, _arcount = struct.unpack(
+            "!HHHHHH", response[:12]
+        )
+    except Exception as exc:
+        _logger.debug("Quad9 DNS response parse failed: %s", exc)
+        return False
+    if resp_id != transaction_id:
+        return False
+    rcode = flags & 0x000F
+    if rcode != 0:
+        return False
+    return ancount > 0
+
+
+def _handle_quad9_attempt_result(success: bool, attempt_number: int) -> bool:
+    global _quad9_attempt_inflight
+    _quad9_attempt_inflight = False
+    if _quad9_check_resolved:
+        return False
+    if success:
+        _resolve_quad9_check(
+            Result.PASS, f"resolved debian.org via Quad9 on attempt {attempt_number}"
+        )
+        return False
+    if _quad9_attempts_made > _DNS_MAX_RETRIES:
+        attempts_total = _quad9_attempts_made
+        _resolve_quad9_check(
+            Result.FAIL, f"Quad9 DNS resolution failed after {attempts_total} attempts"
+        )
+        return False
+    _schedule_quad9_attempt(_DNS_RETRY_INTERVAL_SECONDS)
+    return False
+
+
+def _resolve_quad9_check(result: Result, reason: str) -> None:
+    global _quad9_check_resolved
+    if _quad9_check_resolved or _check_engine is None:
+        return
+    _quad9_check_resolved = True
+    _check_engine.resolve(_DNS_QUAD9_CHECK, result, reason)
 
 
 def _recompute_net_ready() -> None:
