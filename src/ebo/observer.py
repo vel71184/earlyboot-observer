@@ -48,6 +48,7 @@ _UNIT_NAMES = (
 )
 _NET_READY_EVENT = "EVENT_NET_READY"
 _NET_READY_CHECK = "NET_READY"
+_HTTP_DEBIAN_CHECK = "HTTP_OK_DEBIAN"
 _DNS_CHECK = "DNS_OK_SYSTEM"
 _DNS_QUAD9_CHECK = "DNS_OK_QUAD9"
 _DNS_RETRY_INTERVAL_SECONDS = 2
@@ -87,6 +88,9 @@ def _init_check_engine(runtime_limit: float) -> None:
     _register_net_ready_check(runtime_limit)
     _register_dns_check(runtime_limit)
     _register_quad9_check(runtime_limit)
+    register_http_probe(
+        _HTTP_DEBIAN_CHECK, url="https://deb.debian.org", prerequisites=[_NET_READY_EVENT]
+    )
 
 
 def _register_unit_checks(runtime_limit: float) -> None:
