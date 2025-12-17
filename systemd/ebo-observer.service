@@ -1,0 +1,17 @@
+[Unit]
+Description=Early Boot Observer daemon
+DefaultDependencies=no
+After=local-fs.target systemd-journald.service
+
+[Service]
+Type=simple
+Environment=PYTHONPATH=/home/john/earlyboot-observer/src
+ExecStart=/usr/bin/env python3 -m ebo.observer
+TimeoutStartSec=10
+TimeoutStopSec=5
+StandardOutput=journal
+StandardError=journal
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
