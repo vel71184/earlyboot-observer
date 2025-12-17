@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import signal
 import sys
-from threading import Event, Timer
+from threading import Event
 
 from ebo.checks import Check, Engine, Result
 
@@ -24,6 +24,9 @@ _main_loop = None
 _check_engine: Engine | None = None
 _bus = None
 _last_states: dict[str, tuple[str | None, str | None]] = {}
+_systemd_manager = None
+_tracked_units: dict[str, str] = {}
+_unit_paths: dict[str, str] = {}
 _nm_props = None
 _nm_connectivity: str | None = None
 _nm_active_connections: tuple[str, ...] = ()
@@ -31,6 +34,14 @@ _nm_device_ipv4: dict[str, bool] = {}
 _nm_ip4_to_device: dict[str, str] = {}
 _nm_default_route = False
 _nm_net_ready: bool | None = None
+_UNIT_NAMES = (
+    "NetworkManager.service",
+    "ssh.service",
+    "tailscaled.service",
+    "pihole-FTL.service",
+)
+_NET_READY_EVENT = "EVENT_NET_READY"
+_NET_READY_CHECK = "NET_READY"
 
 NM_BUS_NAME = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
@@ -47,30 +58,31 @@ RUNTIME_LIMIT_SECONDS = 30
 def _init_check_engine(runtime_limit: float) -> None:
     global _check_engine
     _check_engine = Engine(_logger, timeout_seconds=runtime_limit)
-    _check_engine.register(Check("CHECK_A", deadline_seconds=runtime_limit))
-    _check_engine.register(Check("CHECK_B", prerequisites=["EVENT_A"], deadline_seconds=runtime_limit))
-    _check_engine.resolve("CHECK_A", Result.PASS, "observer baseline ready")
+    _register_unit_checks(runtime_limit)
+    _register_net_ready_check(runtime_limit)
 
 
-def _emit_demo_event_a() -> bool:
-    if _shutdown.is_set() or _check_engine is None:
-        return False
-    _logger.info("DEMO EVENT EVENT_A observed")
-    _check_engine.emit_event("EVENT_A")
-    _check_engine.resolve("CHECK_B", Result.PASS, "EVENT_A received")
-    return False
-
-
-def _schedule_demo_events(delay_seconds: float) -> None:
-    if GLib is not None:
-        GLib.timeout_add_seconds(int(delay_seconds), _emit_demo_event_a)
+def _register_unit_checks(runtime_limit: float) -> None:
+    if _check_engine is None:
         return
-    Timer(delay_seconds, _emit_demo_event_a).start()
+    for unit in _UNIT_NAMES:
+        _tracked_units[unit] = unit
+        _check_engine.register(Check(unit, deadline_seconds=runtime_limit))
+
+
+def _register_net_ready_check(runtime_limit: float) -> None:
+    if _check_engine is None:
+        return
+    _check_engine.register(
+        Check(_NET_READY_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=runtime_limit)
+    )
 
 
 def _finalize_checks() -> None:
     if _check_engine is None:
         return
+    if _nm_net_ready is not True:
+        _check_engine.resolve(_NET_READY_CHECK, Result.SKIP, "NET_READY not observed")
     _check_engine.enforce_deadlines()
     _check_engine.finalize()
 
@@ -113,6 +125,22 @@ def _resolve_unit_id(path: str) -> str:
         return path
 
 
+def _get_systemd_manager():
+    global _systemd_manager
+    if dbus is None or _bus is None:
+        return None
+    if _systemd_manager is None:
+        try:
+            manager_obj = _bus.get_object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+            _systemd_manager = dbus.Interface(
+                manager_obj, dbus_interface="org.freedesktop.systemd1.Manager"
+            )
+        except Exception as exc:
+            _logger.info("systemd manager unavailable: %s", exc)
+            return None
+    return _systemd_manager
+
+
 def _log_state_change(unit: str, active, sub) -> None:
     active_text = f"ActiveState={active}" if active is not None else None
     sub_text = f"SubState={sub}" if sub is not None else None
@@ -122,14 +150,27 @@ def _log_state_change(unit: str, active, sub) -> None:
         _logger.error("unit %s entered failed state", unit)
 
 
-def _on_properties_changed(interface, changed, _invalidated, path=None, **_kwargs) -> None:
-    if interface != "org.freedesktop.systemd1.Unit":
+def _get_systemd_properties_interface(path: str):
+    if not dbus or not _bus:
+        return None
+    try:
+        proxy = _bus.get_object("org.freedesktop.systemd1", path)
+        return dbus.Interface(proxy, dbus_interface="org.freedesktop.DBus.Properties")
+    except Exception as exc:  # pragma: no cover - best-effort logging path
+        _logger.debug("Could not get systemd properties for %s: %s", path, exc)
+        return None
+
+
+def _resolve_unit_check(unit: str, active_state: str | None) -> None:
+    if _check_engine is None or unit not in _tracked_units:
         return
-    active = changed.get("ActiveState")
-    sub = changed.get("SubState")
-    if active is None and sub is None:
-        return
-    unit = _resolve_unit_id(path or "")
+    if active_state == "active":
+        _check_engine.resolve(unit, Result.PASS, "unit active")
+    elif active_state == "failed":
+        _check_engine.resolve(unit, Result.FAIL, "unit failed")
+
+
+def _update_unit_state(unit: str, active, sub) -> None:
     prev_active, prev_sub = _last_states.get(unit, (None, None))
     current_active = str(active) if active is not None else prev_active
     current_sub = str(sub) if sub is not None else prev_sub
@@ -137,6 +178,75 @@ def _on_properties_changed(interface, changed, _invalidated, path=None, **_kwarg
         return
     _last_states[unit] = (current_active, current_sub)
     _log_state_change(unit, current_active, current_sub)
+    _resolve_unit_check(unit, current_active)
+
+
+def _is_no_such_unit(exc: Exception) -> bool:
+    dbus_name = getattr(exc, "get_dbus_name", lambda: "")()
+    return str(dbus_name) == "org.freedesktop.systemd1.NoSuchUnit"
+
+
+def _load_unit(unit_name: str, manager=None) -> tuple[str | None, bool]:
+    manager = manager or _get_systemd_manager()
+    if not manager:
+        return None, False
+    try:
+        unit_path = manager.LoadUnit(unit_name)
+        return str(unit_path), False
+    except Exception as exc:
+        if _is_no_such_unit(exc):
+            _logger.info("unit %s not found", unit_name)
+            return None, True
+        _logger.debug("Could not load unit %s: %s", unit_name, exc)
+    return None, False
+
+
+def _prime_unit_state(unit_name: str, unit_path: str) -> None:
+    props = _get_systemd_properties_interface(unit_path)
+    if not props:
+        return
+    try:
+        active = props.Get("org.freedesktop.systemd1.Unit", "ActiveState")
+        sub = props.Get("org.freedesktop.systemd1.Unit", "SubState")
+    except Exception as exc:
+        _logger.debug("Could not read initial state for %s: %s", unit_name, exc)
+        return
+    _update_unit_state(unit_name, active, sub)
+
+
+def _track_unit(unit_name: str, manager=None) -> None:
+    if _check_engine is None:
+        return
+    path, missing = _load_unit(unit_name, manager=manager)
+    if not path:
+        if missing:
+            _check_engine.resolve(unit_name, Result.SKIP, "unit not found")
+        return
+    path = str(path)
+    _unit_paths[path] = unit_name
+    _prime_unit_state(unit_name, path)
+
+
+def _init_systemd_units() -> None:
+    manager = _get_systemd_manager()
+    if _check_engine is None or not manager:
+        return
+    for unit in _UNIT_NAMES:
+        _track_unit(unit, manager)
+
+
+def _on_properties_changed(interface, changed, _invalidated, path=None, **_kwargs) -> None:
+    if interface != "org.freedesktop.systemd1.Unit":
+        return
+    active = changed.get("ActiveState")
+    sub = changed.get("SubState")
+    if active is None and sub is None:
+        return
+    unit_path = str(path or "")
+    unit = _unit_paths.get(unit_path) or _resolve_unit_id(unit_path)
+    if unit not in _tracked_units:
+        return
+    _update_unit_state(unit, active, sub)
 
 
 def _on_job_removed(_job_id, _job_path, unit, result, **_kwargs) -> None:
@@ -152,9 +262,7 @@ def _register_systemd_signal_listeners() -> None:
         _on_properties_changed,
         signal_name="PropertiesChanged",
         dbus_interface="org.freedesktop.DBus.Properties",
-        bus_name="org.freedesktop.systemd1",
         path_keyword="path",
-        arg0="org.freedesktop.systemd1.Unit",
     )
     _bus.add_signal_receiver(
         _on_job_removed,
@@ -336,6 +444,13 @@ def _update_nm_connectivity(raw) -> None:
     _recompute_net_ready()
 
 
+def _on_net_ready() -> None:
+    if _check_engine is None:
+        return
+    _check_engine.emit_event(_NET_READY_EVENT)
+    _check_engine.resolve(_NET_READY_CHECK, Result.PASS, "network ready")
+
+
 def _recompute_net_ready() -> None:
     global _nm_net_ready
     has_ipv4 = any(_nm_device_ipv4.values())
@@ -345,6 +460,8 @@ def _recompute_net_ready() -> None:
         return
     _nm_net_ready = net_ready
     _logger.info("NET_READY=%s", net_ready)
+    if net_ready:
+        _on_net_ready()
 
 
 def _prime_network_manager_state() -> None:
@@ -521,12 +638,12 @@ def _timeout_shutdown() -> bool:
 def main() -> int:
     _setup_logging()
     _init_check_engine(RUNTIME_LIMIT_SECONDS)
-    _schedule_demo_events(1)
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     _logger.info("ebo-observer starting up")
     if _connect_dbus():
+        _init_systemd_units()
         GLib.timeout_add_seconds(RUNTIME_LIMIT_SECONDS, _timeout_shutdown)
         _main_loop.run()
     else:
