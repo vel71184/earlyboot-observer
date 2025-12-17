@@ -67,6 +67,10 @@ _quad9_check_resolved = False
 _quad9_attempt_inflight = False
 _HTTP_PROBE_DEADLINE_SECONDS = 10
 _HTTP_PROBE_REQUEST_TIMEOUT_SECONDS = 5
+_HTTP_PIHOLE_API = "HTTP_PIHOLE_API"
+_HTTP_NEXTCLOUD_STATUS = "HTTP_NEXTCLOUD_STATUS"
+_HTTP_OLLAMA_TAGS = "HTTP_OLLAMA_TAGS"
+_HTTP_FASTAPI_WHISPER_DOCS = "HTTP_FASTAPI_WHISPER_DOCS"
 _http_probes: dict[str, dict[str, object]] = {}
 
 NM_BUS_NAME = "org.freedesktop.NetworkManager"
@@ -88,8 +92,32 @@ def _init_check_engine(runtime_limit: float) -> None:
     _register_net_ready_check(runtime_limit)
     _register_dns_check(runtime_limit)
     _register_quad9_check(runtime_limit)
+    _register_http_service_checks()
     register_http_probe(
         _HTTP_DEBIAN_CHECK, url="https://deb.debian.org", prerequisites=[_NET_READY_EVENT]
+    )
+
+
+def _register_http_service_checks() -> None:
+    register_http_probe(
+        _HTTP_PIHOLE_API,
+        url="http://127.0.0.1/admin/api.php",
+        prerequisites=[_NET_READY_EVENT],
+        expected_json=("domains_being_blocked", None),
+    )
+    register_http_probe(
+        _HTTP_NEXTCLOUD_STATUS,
+        url="http://127.0.0.1/nextcloud/status.php",
+        prerequisites=[_NET_READY_EVENT],
+        expected_json=("installed", True),
+    )
+    register_http_probe(
+        _HTTP_OLLAMA_TAGS, url="http://127.0.0.1:11434/api/tags", prerequisites=[_NET_READY_EVENT]
+    )
+    register_http_probe(
+        _HTTP_FASTAPI_WHISPER_DOCS,
+        url="http://127.0.0.1:8000/docs",
+        prerequisites=[_NET_READY_EVENT],
     )
 
 
@@ -202,12 +230,19 @@ def _run_http_probe(name: str) -> None:
                     success = False
                     reason = "HTTP response JSON was not an object"
                 else:
-                    actual = payload.get(key)
-                    if actual != expected_value:
-                        success = False
-                        reason = f"expected {key!r}={expected_value!r}, got {actual!r}"
+                    if expected_value is None:
+                        if key in payload:
+                            reason = f"HTTP {status} JSON contained {key!r}"
+                        else:
+                            success = False
+                            reason = f"expected JSON key {key!r} to exist"
                     else:
-                        reason = f"HTTP {status} JSON matched {key!r}"
+                        actual = payload.get(key)
+                        if actual != expected_value:
+                            success = False
+                            reason = f"expected {key!r}={expected_value!r}, got {actual!r}"
+                        else:
+                            reason = f"HTTP {status} JSON matched {key!r}"
     except urllib.error.HTTPError as exc:
         reason = f"HTTP error {exc.code} for {url}"
     except Exception as exc:
