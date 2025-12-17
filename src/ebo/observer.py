@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import signal
 import socket
-import subprocess
 import sys
 import struct
+import urllib.error
+import urllib.request
 from threading import Event, Thread
 
 from ebo.checks import Check, Engine, Result
@@ -62,6 +64,9 @@ _quad9_probe_started = False
 _quad9_attempts_made = 0
 _quad9_check_resolved = False
 _quad9_attempt_inflight = False
+_HTTP_PROBE_DEADLINE_SECONDS = 10
+_HTTP_PROBE_REQUEST_TIMEOUT_SECONDS = 5
+_http_probes: dict[str, dict[str, object]] = {}
 
 NM_BUS_NAME = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
@@ -116,6 +121,110 @@ def _register_quad9_check(runtime_limit: float) -> None:
     _check_engine.register(
         Check(_DNS_QUAD9_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=deadline)
     )
+
+
+def register_http_probe(
+    name: str,
+    url: str = "http://127.0.0.1",
+    prerequisites: list[str] | tuple[str, ...] | None = None,
+    expected_json: tuple[str, object] | None = None,
+    deadline_seconds: float = _HTTP_PROBE_DEADLINE_SECONDS,
+) -> None:
+    """Register a one-shot HTTP check that runs off the main loop."""
+    if _check_engine is None:
+        return
+    prereqs = list(prerequisites) if prerequisites else []
+    deadline = deadline_seconds or 0.0
+    if RUNTIME_LIMIT_SECONDS:
+        deadline = min(deadline or _HTTP_PROBE_DEADLINE_SECONDS, RUNTIME_LIMIT_SECONDS)
+    check = Check(name, prerequisites=prereqs, deadline_seconds=deadline)
+    _check_engine.register(check)
+    if GLib is None:
+        _check_engine.resolve(name, Result.SKIP, "GLib unavailable for HTTP probe")
+        return
+    _http_probes[name] = {
+        "check": check,
+        "url": url,
+        "expected_json": expected_json,
+        "started": False,
+        "resolved": False,
+    }
+    GLib.timeout_add(250, _await_http_probe_arming, name)
+
+
+def _await_http_probe_arming(name: str) -> bool:
+    state = _http_probes.get(name)
+    if not state:
+        return False
+    check = state.get("check")
+    if not isinstance(check, Check):
+        return False
+    if state.get("resolved") or check.result is not None:
+        state["resolved"] = True
+        return False
+    if check.state != "armed":
+        return True
+    if state.get("started"):
+        return False
+    state["started"] = True
+    Thread(target=_run_http_probe, args=(name,), daemon=True).start()
+    return False
+
+
+def _run_http_probe(name: str) -> None:
+    state = _http_probes.get(name)
+    if not state:
+        return
+    url = str(state.get("url", "http://127.0.0.1"))
+    expected_json = state.get("expected_json")
+    success = False
+    reason = f"HTTP probe failed for {url}"
+    try:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=_HTTP_PROBE_REQUEST_TIMEOUT_SECONDS) as resp:
+            status = getattr(resp, "status", resp.getcode())
+            body = resp.read()
+        success = True
+        reason = f"HTTP {status} from {url}"
+        if expected_json is not None:
+            key, expected_value = expected_json
+            try:
+                payload = json.loads(body)
+            except Exception as exc:
+                success = False
+                reason = f"HTTP response JSON decode failed: {exc}"
+            else:
+                if not isinstance(payload, dict):
+                    success = False
+                    reason = "HTTP response JSON was not an object"
+                else:
+                    actual = payload.get(key)
+                    if actual != expected_value:
+                        success = False
+                        reason = f"expected {key!r}={expected_value!r}, got {actual!r}"
+                    else:
+                        reason = f"HTTP {status} JSON matched {key!r}"
+    except urllib.error.HTTPError as exc:
+        reason = f"HTTP error {exc.code} for {url}"
+    except Exception as exc:
+        reason = f"HTTP probe failed for {url}: {exc}"
+    if GLib is None:
+        if _check_engine is not None:
+            _check_engine.resolve(name, Result.FAIL if not success else Result.PASS, reason)
+        return
+    GLib.idle_add(_complete_http_probe, name, success, reason)
+
+
+def _complete_http_probe(name: str, success: bool, reason: str) -> bool:
+    state = _http_probes.get(name)
+    if not state or state.get("resolved"):
+        return False
+    state["resolved"] = True
+    if _check_engine is None:
+        return False
+    result = Result.PASS if success else Result.FAIL
+    _check_engine.resolve(name, result, reason)
+    return False
 
 
 def _finalize_checks() -> None:
