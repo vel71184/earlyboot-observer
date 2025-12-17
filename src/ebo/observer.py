@@ -299,6 +299,16 @@ def _finalize_checks() -> None:
         _check_engine.resolve(_NET_READY_CHECK, Result.SKIP, "NET_READY not observed")
     _check_engine.enforce_deadlines()
     _check_engine.finalize()
+    counts, failed = _check_engine.summary()
+    failed_clause = f" FAILED={','.join(failed)}" if failed else ""
+    _logger.info(
+        "SUMMARY PASS=%d FAIL=%d SKIP=%d WARN=%d%s",
+        counts.get(Result.PASS, 0),
+        counts.get(Result.FAIL, 0),
+        counts.get(Result.SKIP, 0),
+        counts.get(Result.WARN, 0),
+        failed_clause,
+    )
 
 
 def _setup_logging() -> None:

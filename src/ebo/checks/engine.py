@@ -93,6 +93,17 @@ class Engine:
             else:
                 self.resolve(check.name, Result.FAIL, "global timeout before completion")
 
+    def summary(self) -> tuple[dict[Result, int], list[str]]:
+        counts: dict[Result, int] = {result: 0 for result in Result}
+        failed_checks: list[str] = []
+        for check in self._checks.values():
+            if check.result is None:
+                continue
+            counts[check.result] = counts.get(check.result, 0) + 1
+            if check.result is Result.FAIL:
+                failed_checks.append(check.name)
+        return counts, failed_checks
+
     def _try_arm(self, check: Check) -> None:
         if check.state != "pending":
             return
