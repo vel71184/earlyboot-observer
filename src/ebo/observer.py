@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import signal
+import socket
+import subprocess
 import sys
-from threading import Event
+from threading import Event, Thread
 
 from ebo.checks import Check, Engine, Result
 
@@ -42,6 +44,15 @@ _UNIT_NAMES = (
 )
 _NET_READY_EVENT = "EVENT_NET_READY"
 _NET_READY_CHECK = "NET_READY"
+_DNS_CHECK = "DNS_OK_SYSTEM"
+_DNS_RETRY_INTERVAL_SECONDS = 2
+_DNS_MAX_RETRIES = 5
+_DNS_DEADLINE_SECONDS = 12
+_DNS_ATTEMPT_TIMEOUT_SECONDS = 2
+_dns_probe_started = False
+_dns_attempts_made = 0
+_dns_check_resolved = False
+_dns_attempt_inflight = False
 
 NM_BUS_NAME = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
@@ -60,6 +71,7 @@ def _init_check_engine(runtime_limit: float) -> None:
     _check_engine = Engine(_logger, timeout_seconds=runtime_limit)
     _register_unit_checks(runtime_limit)
     _register_net_ready_check(runtime_limit)
+    _register_dns_check(runtime_limit)
 
 
 def _register_unit_checks(runtime_limit: float) -> None:
@@ -75,6 +87,15 @@ def _register_net_ready_check(runtime_limit: float) -> None:
         return
     _check_engine.register(
         Check(_NET_READY_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=runtime_limit)
+    )
+
+
+def _register_dns_check(runtime_limit: float) -> None:
+    if _check_engine is None:
+        return
+    deadline = min(_DNS_DEADLINE_SECONDS, runtime_limit) if runtime_limit else _DNS_DEADLINE_SECONDS
+    _check_engine.register(
+        Check(_DNS_CHECK, prerequisites=[_NET_READY_EVENT], deadline_seconds=deadline)
     )
 
 
@@ -449,6 +470,92 @@ def _on_net_ready() -> None:
         return
     _check_engine.emit_event(_NET_READY_EVENT)
     _check_engine.resolve(_NET_READY_CHECK, Result.PASS, "network ready")
+    _start_dns_probe()
+
+
+def _start_dns_probe() -> None:
+    global _dns_probe_started, _dns_attempts_made, _dns_check_resolved, _dns_attempt_inflight
+    if _check_engine is None or GLib is None:
+        return
+    if _dns_probe_started:
+        return
+    _dns_probe_started = True
+    _dns_attempts_made = 0
+    _dns_check_resolved = False
+    _dns_attempt_inflight = False
+    _schedule_dns_attempt(0)
+
+
+def _schedule_dns_attempt(delay_seconds: int) -> None:
+    if _dns_check_resolved or GLib is None:
+        return
+    GLib.timeout_add_seconds(delay_seconds, _spawn_dns_attempt_thread)
+
+
+def _spawn_dns_attempt_thread() -> bool:
+    global _dns_attempt_inflight
+    if _dns_check_resolved:
+        return False
+    if _dns_attempt_inflight:
+        return False
+    _dns_attempt_inflight = True
+    Thread(target=_run_dns_attempt, daemon=True).start()
+    return False
+
+
+def _run_dns_attempt() -> None:
+    global _dns_attempts_made
+    _dns_attempts_made += 1
+    attempt_number = _dns_attempts_made
+    success = _perform_dns_lookup()
+    if GLib is None:
+        return
+    GLib.idle_add(_handle_dns_attempt_result, success, attempt_number)
+
+
+def _perform_dns_lookup() -> bool:
+    try:
+        result = subprocess.run(
+            ["getent", "hosts", "debian.org"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_DNS_ATTEMPT_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode == 0:
+            return True
+    except Exception as exc:
+        _logger.debug("DNS getent failed: %s", exc)
+    try:
+        socket.getaddrinfo("debian.org", None)
+        return True
+    except Exception as exc:
+        _logger.debug("DNS getaddrinfo failed: %s", exc)
+    return False
+
+
+def _handle_dns_attempt_result(success: bool, attempt_number: int) -> bool:
+    global _dns_attempt_inflight
+    _dns_attempt_inflight = False
+    if _dns_check_resolved:
+        return False
+    if success:
+        _resolve_dns_check(Result.PASS, f"resolved debian.org on attempt {attempt_number}")
+        return False
+    if _dns_attempts_made > _DNS_MAX_RETRIES:
+        attempts_total = _dns_attempts_made
+        _resolve_dns_check(Result.FAIL, f"DNS resolution failed after {attempts_total} attempts")
+        return False
+    _schedule_dns_attempt(_DNS_RETRY_INTERVAL_SECONDS)
+    return False
+
+
+def _resolve_dns_check(result: Result, reason: str) -> None:
+    global _dns_check_resolved
+    if _dns_check_resolved or _check_engine is None:
+        return
+    _dns_check_resolved = True
+    _check_engine.resolve(_DNS_CHECK, result, reason)
 
 
 def _recompute_net_ready() -> None:
